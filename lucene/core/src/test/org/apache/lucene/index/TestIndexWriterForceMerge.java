@@ -16,8 +16,6 @@
  */
 package org.apache.lucene.index;
 
-import java.io.IOException;
-import java.util.Locale;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
@@ -29,6 +27,15 @@ import org.apache.lucene.tests.analysis.MockTokenizer;
 import org.apache.lucene.tests.store.MockDirectoryWrapper;
 import org.apache.lucene.tests.util.LuceneTestCase;
 import org.apache.lucene.tests.util.TestUtil;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class TestIndexWriterForceMerge extends LuceneTestCase {
   public void testPartialMerge() throws IOException {
@@ -288,5 +295,80 @@ public class TestIndexWriterForceMerge extends LuceneTestCase {
     }
 
     dir.close();
+  }
+
+  public void testForceMergeWithConcurrentCommits() throws Exception {
+    boolean debug = false;
+    ExecutorService executorService = Executors.newFixedThreadPool(2);
+    try (Directory dir = newDirectory()) {
+      try (IndexWriter writer = new IndexWriter(
+        dir,
+        newIndexWriterConfig(new MockAnalyzer(random()))
+          .setOpenMode(OpenMode.CREATE)
+          .setMaxBufferedDocs(2)
+          .setMergePolicy(newLogMergePolicy(51)))) {
+        AtomicInteger docIndex = new AtomicInteger();
+        List<Callable<Void>> concurrentCommits = new ArrayList<>();
+        for (int i = 0; i < 200; i++) {
+          // Create and commit two segments.
+          addDoc(docIndex.incrementAndGet(), writer);
+          writer.commit();
+          addDoc(docIndex.incrementAndGet(), writer);
+          writer.commit();
+          SegmentInfos infos = SegmentInfos.readLatestCommit(dir);
+          assertTrue(i == 0 ? infos.size() == 2 : infos.size() >= 3 && infos.size() <= 4);
+          if (debug) {
+            printSegments("\n\nBefore concurrent commits", -1, dir);
+          }
+
+          concurrentCommits.clear();
+          concurrentCommits.add(() -> {
+            writer.forceMerge(1);
+            long seq = writer.commit();
+            if (debug) {
+              printSegments("Force merge commit", seq, dir);
+            }
+            return null;
+          });
+          concurrentCommits.add(() -> {
+            Thread.sleep(random().nextInt(10));
+            addDoc(docIndex.incrementAndGet(), writer);
+            long seq = writer.commit();
+            if (debug) {
+              printSegments("Concurrent indexing commit", seq, dir);
+            }
+            return null;
+          });
+
+          executorService.invokeAll(concurrentCommits);
+
+          infos = SegmentInfos.readLatestCommit(dir);
+          assertTrue(infos.size() >= 1 && infos.size() <= 2);
+          if (debug) {
+            printSegments("After concurrent commits", -1, dir);
+          }
+        }
+      }
+    } finally {
+      executorService.shutdown();
+    }
+  }
+
+  private void addDoc(int docIndex, IndexWriter writer) throws IOException {
+    Document doc = new Document();
+    doc.add(newStringField("field", "value" + docIndex, Field.Store.NO));
+    writer.addDocument(doc);
+  }
+
+  private void printSegments(String message, long seq, Directory dir) throws IOException {
+    StringBuilder s = new StringBuilder();
+    if (seq != -1) {
+      s.append("(").append(seq).append(") ");
+    }
+    s.append(message).append(":");
+    for (SegmentCommitInfo segment : SegmentInfos.readLatestCommit(dir)) {
+      s.append("\n  ").append(segment.info.name);
+    }
+    System.out.println(s);
   }
 }
